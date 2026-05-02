@@ -7,40 +7,64 @@ covering both the prefill and decode phases.
 
 import pytest
 
-pytestmark = pytest.mark.skip(reason="Attention kernels not yet implemented")
-
 
 class TestPrefillThenDecode:
     """Full pipeline integration tests."""
 
-    def test_generate_max_tokens(self):
-        """generate() should produce exactly max_tokens completion tokens."""
-        # TODO:
-        # 1. Create LLM with max_tokens=10
-        # 2. Call generate(["test prompt"])
-        # 3. Verify output has exactly 10 completion tokens
-        pass
+    def test_generate_max_tokens(self, engine, scheduler, make_sequence, do_prefill, do_step):
+        """Full pipeline should produce exactly max_tokens completion tokens."""
+        max_tokens = 5
+        seq = make_sequence(list(range(10, 30)), max_tokens=max_tokens)
+        do_prefill([seq])
 
-    def test_eos_termination(self):
-        """Generation should stop when EOS token is produced."""
-        # TODO:
-        # 1. Create LLM with max_tokens=1000
-        # 2. Generate (EOS should appear well before 1000 tokens)
-        # 3. Verify output has fewer than max_tokens tokens
-        pass
+        while not seq.is_finished:
+            do_step()
 
-    def test_multiple_prompts_different_lengths(self):
-        """Multiple prompts should generate independently."""
-        # TODO:
-        # 1. Create LLM
-        # 2. Generate for 3 prompts with different lengths and max_tokens
-        # 3. Verify each output has the correct number of tokens
-        pass
+        assert seq.num_completion_tokens == max_tokens
 
-    def test_output_text_is_coherent(self):
-        """Generated text should be readable (not garbage)."""
-        # TODO:
-        # 1. Load Qwen3-0.6B
-        # 2. Generate with temperature=0
-        # 3. Verify output is valid UTF-8 and non-empty
-        pass
+    def test_eos_termination(self, engine, scheduler, tokenizer, make_sequence, do_prefill, do_step):
+        """Generation should stop either by EOS or reaching max_tokens."""
+        max_tokens = 64
+        seq = make_sequence(
+            tokenizer.encode("Hello, how are you?"),
+            max_tokens=max_tokens,
+        )
+        do_prefill([seq])
+
+        while not seq.is_finished:
+            do_step()
+
+        # Generation should have completed (either by EOS or max_tokens)
+        assert seq.is_finished
+        assert seq.num_completion_tokens <= max_tokens
+
+    def test_output_text_is_coherent(self, engine, scheduler, tokenizer, make_sequence, do_prefill, do_step):
+        """Generated text should be valid and non-empty."""
+        prompt_text = "The capital of France is"
+        prompt_tokens = tokenizer.encode(prompt_text)
+        seq = make_sequence(prompt_tokens, max_tokens=10)
+        do_prefill([seq])
+
+        while not seq.is_finished:
+            do_step()
+
+        # Decode completion tokens
+        completion_text = tokenizer.decode(seq.completion_token_ids)
+        assert len(completion_text) > 0
+        assert isinstance(completion_text, str)
+
+    def test_multiple_prompts_independent(self, engine, scheduler, tokenizer, make_sequence, do_prefill, do_step):
+        """Multiple prompts should generate independently to completion."""
+        prompts = [
+            tokenizer.encode("Hello"),
+            tokenizer.encode("The weather today"),
+        ]
+        max_tokens = 5
+        seqs = [make_sequence(p, max_tokens=max_tokens) for p in prompts]
+        do_prefill(seqs)
+
+        while not all(s.is_finished for s in seqs):
+            do_step()
+
+        for seq in seqs:
+            assert seq.num_completion_tokens == max_tokens

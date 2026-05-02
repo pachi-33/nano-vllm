@@ -7,30 +7,44 @@ gets independent attention.
 """
 
 import pytest
-
-pytestmark = pytest.mark.skip(reason="Attention kernels not yet implemented")
+from nanovllm.engine.sequence import SequenceStatus
 
 
 class TestBatchedPrefill:
     """End-to-end prefill for multiple prompts."""
 
-    def test_two_prompts_different_lengths(self):
+    def test_two_prompts_different_lengths(self, engine, scheduler, make_sequence, do_prefill):
         """Two prompts of different lengths should both complete prefill."""
-        # TODO: Implement after kernels are ready
-        # 1. Create LLM
-        # 2. Add two requests with different prompt lengths
-        # 3. Run step() once
-        # 4. Verify both sequences have is_prefill transitioned correctly
-        # 5. Verify each sequence produced output tokens independently
-        pass
+        seq1 = make_sequence(list(range(10, 30)))   # 20 tokens
+        seq2 = make_sequence(list(range(100, 200))) # 100 tokens
+        seqs = do_prefill([seq1, seq2])
 
-    def test_cu_seqlens_correctness(self):
-        """Verify cu_seqlens_q and cu_seqlens_k are correctly constructed."""
-        # TODO: Verify the tensors built by prepare_prefill match expected values
-        # for a set of sequences with known token counts
-        pass
+        assert len(seqs) == 2
+        for seq in seqs:
+            assert seq.status == SequenceStatus.RUNNING
+            assert seq.num_completion_tokens == 1
 
-    def test_independent_outputs(self):
-        """Each sequence's output should not be affected by other sequences."""
-        # TODO: Run same prompt alone and in batch → verify output is close
-        pass
+    def test_batched_block_tables_independent(self, engine, scheduler, make_sequence, do_prefill):
+        """Each sequence should get its own independent blocks."""
+        seq1 = make_sequence(list(range(50)))
+        seq2 = make_sequence(list(range(100)))
+        seqs = do_prefill([seq1, seq2])
+
+        # Block tables should not share physical blocks
+        blocks1 = set(seq1.block_table)
+        blocks2 = set(seq2.block_table)
+        assert not blocks1.intersection(blocks2), "Sequences share physical blocks"
+
+    def test_three_prompts(self, engine, scheduler, make_sequence, do_prefill):
+        """Three prompts should all prefill correctly."""
+        seqs = [
+            make_sequence(list(range(10))),
+            make_sequence(list(range(20))),
+            make_sequence(list(range(30))),
+        ]
+        results = do_prefill(seqs)
+
+        assert len(results) == 3
+        for seq in results:
+            assert seq.status == SequenceStatus.RUNNING
+            assert seq.num_completion_tokens == 1

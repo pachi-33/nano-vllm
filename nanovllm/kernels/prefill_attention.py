@@ -459,6 +459,126 @@ The signatures are intentionally similar to minimize the integration change.
 
 import torch
 from torch import Tensor
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _prefill_attention_kernel(
+    Q_ptr, q_stride_s, q_stride_h, q_stride_d,
+    K_ptr, k_stride_s, k_stride_h, k_stride_d,
+    V_ptr, v_stride_s, v_stride_h, v_stride_d,
+    K_cache_ptr, kc_stride_block, kc_stride_page, kc_stride_head, kc_stride_dim,
+    V_cache_ptr, vc_stride_block, vc_stride_page, vc_stride_head, vc_stride_dim,
+    O_ptr, o_stride_s, o_stride_h, o_stride_d,
+    cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
+    Block_table_ptr, bt_stride_b, bt_stride_s,
+    scale,
+    num_kv_heads,
+    num_heads,
+    page_size,
+    MAX_N_BLOCKS: tl.constexpr,
+    HAS_BLOCK_TABLE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    m_block = tl.program_id(0)
+    bidb = tl.program_id(1)
+    bidh = tl.program_id(2)
+
+    kv_head = bidh * num_kv_heads // num_heads
+
+    cu_q_start = tl.load(cu_seqlens_q_ptr + bidb)
+    cu_q_end = tl.load(cu_seqlens_q_ptr + bidb + 1)
+    seqlen_q = cu_q_end - cu_q_start
+    if m_block * BLOCK_M >= seqlen_q:
+        return
+
+    cu_k_start = tl.load(cu_seqlens_k_ptr + bidb)
+    seqlen_k = tl.load(cu_seqlens_k_ptr + bidb + 1) - cu_k_start
+
+    actual_m = tl.minimum(BLOCK_M, seqlen_q - m_block * BLOCK_M)
+    q_start = cu_q_start + m_block * BLOCK_M
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    mask_q = offs_m < actual_m
+
+    # Load Q tile: [BLOCK_M, HEAD_DIM]
+    q_offsets = (q_start + offs_m[:, None]) * q_stride_s + bidh * q_stride_h + offs_d[None, :] * q_stride_d
+    q_tile = tl.load(Q_ptr + q_offsets, mask=mask_q[:, None], other=0.0)
+
+    # Online softmax accumulators
+    m_vec = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
+    l_vec = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    # Causal: Q[i] attends to K[j] iff j <= i + (seqlen_k - seqlen_q)
+    kv_offset = seqlen_k - seqlen_q
+    q_end_local = tl.minimum((m_block + 1) * BLOCK_M, seqlen_q)
+    max_k_valid = q_end_local + kv_offset
+    n_block_max = (max_k_valid + BLOCK_N - 1) // BLOCK_N
+
+    offs_n = tl.arange(0, BLOCK_N)
+
+    for n_block in range(MAX_N_BLOCKS):
+        if n_block < n_block_max:
+            actual_n = tl.minimum(BLOCK_N, seqlen_k - n_block * BLOCK_N)
+            mask_k = offs_n < actual_n
+
+            # Causal mask: k_local <= q_local + (seqlen_k - seqlen_q)
+            q_local = m_block * BLOCK_M + offs_m[:, None]  # [BLOCK_M, 1]
+            k_local = n_block * BLOCK_N + offs_n[None, :]  # [1, BLOCK_N]
+            causal_mask = k_local <= q_local + kv_offset
+            valid_mask = mask_q[:, None] & mask_k[None, :] & causal_mask
+
+            # Load K tile
+            if HAS_BLOCK_TABLE:
+                # Map n_block to correct page and offset within page
+                logical_pos_start = n_block * BLOCK_N
+                page_idx = logical_pos_start // page_size
+                offset_in_page = logical_pos_start % page_size
+                physical_block = tl.load(Block_table_ptr + bidb * bt_stride_b + page_idx * bt_stride_s)
+                k_base = physical_block * kc_stride_block + kv_head * kc_stride_head
+                k_row_offsets = (offset_in_page + offs_n) * kc_stride_page
+                k_offsets = k_row_offsets[:, None] + offs_d[None, :] * kc_stride_dim
+                k_tile = tl.load(K_cache_ptr + k_base + k_offsets, mask=mask_k[:, None], other=0.0)
+
+                v_base = physical_block * vc_stride_block + kv_head * vc_stride_head
+                v_row_offsets = (offset_in_page + offs_n) * vc_stride_page
+                v_offsets = v_row_offsets[:, None] + offs_d[None, :] * vc_stride_dim
+                v_tile = tl.load(V_cache_ptr + v_base + v_offsets, mask=mask_k[:, None], other=0.0)
+            else:
+                k_start = cu_k_start + n_block * BLOCK_N
+                k_offsets = (k_start + offs_n[:, None]) * k_stride_s + kv_head * k_stride_h + offs_d[None, :] * k_stride_d
+                k_tile = tl.load(K_ptr + k_offsets, mask=mask_k[:, None], other=0.0)
+
+                v_offsets = (k_start + offs_n[:, None]) * v_stride_s + kv_head * v_stride_h + offs_d[None, :] * v_stride_d
+                v_tile = tl.load(V_ptr + v_offsets, mask=mask_k[:, None], other=0.0)
+
+            # Compute scores: [BLOCK_M, BLOCK_N]
+            # Cast to float32 for tl.dot — Triton 2.2.0 MLIR backend crashes with fp16 tl.dot on V100
+            scores = tl.dot(q_tile.to(tl.float32), tl.trans(k_tile).to(tl.float32)) * scale
+            scores = tl.where(valid_mask, scores, float('-inf'))
+
+            # Online softmax (FlashAttention: m_new = max(m_prev, rowmax(S)))
+            m_new = tl.max(scores, axis=1)  # [BLOCK_M]
+            m_new = tl.maximum(m_vec, m_new)
+            rescale = tl.math.exp(m_vec - m_new)
+            l_vec = l_vec * rescale
+            acc = acc * rescale[:, None]
+
+            p = tl.math.exp(scores - m_new[:, None])
+            l_vec += tl.sum(p, axis=1)
+            acc += tl.dot(p, v_tile.to(tl.float32))
+
+            m_vec = m_new
+
+    # Normalize and store
+    acc = acc / l_vec[:, None]
+    o_offsets = (q_start + offs_m[:, None]) * o_stride_s + bidh * o_stride_h + offs_d[None, :] * o_stride_d
+    tl.store(O_ptr + o_offsets, acc.to(Q_ptr.dtype.element_ty), mask=mask_q[:, None])
 
 
 def prefill_attention(
@@ -473,38 +593,51 @@ def prefill_attention(
     causal: bool = True,
     block_table: Tensor | None = None,  # [num_seqs, max_blocks_per_seq] int32
 ) -> Tensor:                # [total_q, num_heads, head_dim]
-    """
-    Prefill-phase paged attention (replacement for flash_attn_varlen_func).
+    total_q, num_heads, head_dim = q.shape
+    num_seqs = cu_seqlens_q.shape[0] - 1
 
-    Multiple variable-length sequences are packed into contiguous Q/K/V tensors.
-    Supports optional paged KV cache access for prefix caching via ``block_table``.
+    o = torch.empty_like(q)
 
-    Args:
-        q: Packed query tensor. Shape ``[total_q, num_heads, head_dim]``.
-        k: Packed key tensor or paged key cache. Shape ``[total_k, num_kv_heads, head_dim]``
-            (direct) or ``[num_blocks, page_size, num_kv_heads, head_dim]`` (paged).
-        v: Same as ``k``.
-        cu_seqlens_q: Cumulative sequence lengths for Q. Shape ``[num_seqs + 1]``, dtype int32.
-            ``cu_seqlens_q[i]`` and ``cu_seqlens_q[i+1]`` delimit sequence ``i``'s Q tokens.
-        cu_seqlens_k: Cumulative sequence lengths for K. Shape ``[num_seqs + 1]``, dtype int32.
-            When prefix cache is active, ``cu_seqlens_k[-1] > cu_seqlens_q[-1]``.
-        max_seqlen_q: Maximum Q sequence length (used for kernel launch configuration).
-        max_seqlen_k: Maximum K sequence length.
-        scale: Softmax scale factor, typically ``1.0 / sqrt(head_dim)``.
-        causal: Whether to apply causal masking. Default True.
-        block_table: Optional logical-to-physical block mapping for paged KV cache.
-            Shape ``[num_seqs, max_blocks_per_seq]``, dtype int32.
-            When provided, ``k`` and ``v`` are treated as paged cache tensors.
-            When None, ``k`` and ``v`` are accessed directly as contiguous tensors.
+    has_block_table = block_table is not None
 
-    Returns:
-        Attention output tensor. Shape ``[total_q, num_heads, head_dim]``.
+    # Determine K/V cache strides (only used when HAS_BLOCK_TABLE)
+    if has_block_table:
+        num_blocks, page_size_val, num_kv_heads, _ = k.shape
+        kc_s0, kc_s1, kc_s2, kc_s3 = k.stride(0), k.stride(1), k.stride(2), k.stride(3)
+        vc_s0, vc_s1, vc_s2, vc_s3 = v.stride(0), v.stride(1), v.stride(2), v.stride(3)
+        bt_s0, bt_s1 = block_table.stride(0), block_table.stride(1)
+    else:
+        num_blocks = 0
+        page_size_val = 256
+        num_kv_heads = k.shape[1]
+        kc_s0 = kc_s1 = kc_s2 = kc_s3 = 0
+        vc_s0 = vc_s1 = vc_s2 = vc_s3 = 0
+        bt_s0 = bt_s1 = 0
 
-    Note:
-        This function currently raises NotImplementedError. The Triton kernel
-        implementation will be added in a future commit.
-    """
-    raise NotImplementedError(
-        "prefill_attention Triton kernel not yet implemented. "
-        "See module docstring for full technical specification."
+    BLOCK_M = 64
+    BLOCK_N = 64
+    max_n_blocks = triton.cdiv(max_seqlen_k, BLOCK_N)
+    grid = (triton.cdiv(max_seqlen_q, BLOCK_M), num_seqs, num_heads)
+
+    _prefill_attention_kernel[grid](
+        q, q.stride(0), q.stride(1), q.stride(2),
+        k, k.stride(0), k.stride(1), k.stride(2),
+        v, v.stride(0), v.stride(1), v.stride(2),
+        k, kc_s0, kc_s1, kc_s2, kc_s3,   # K_cache args (same ptr when HAS_BLOCK_TABLE)
+        v, vc_s0, vc_s1, vc_s2, vc_s3,   # V_cache args
+        o, o.stride(0), o.stride(1), o.stride(2),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        block_table if has_block_table else torch.empty(1, device=q.device, dtype=torch.int32),
+        bt_s0, bt_s1,
+        scale,
+        num_kv_heads,
+        num_heads,
+        page_size_val,
+        MAX_N_BLOCKS=max_n_blocks,
+        HAS_BLOCK_TABLE=has_block_table,
+        HEAD_DIM=triton.next_power_of_2(head_dim),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
     )
+    return o

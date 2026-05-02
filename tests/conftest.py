@@ -2,14 +2,36 @@
 Shared test fixtures and reference implementations for nano-vLLM kernel tests.
 
 This module provides:
-- Pytest fixtures for GPU detection, model configs, and tensor factories
+- Auto-set TORCHDYNAMO_DISABLE=1 for Triton 2.2.0 compatibility
+- Pytest CLI options (--cuda-device)
+- GPU detection, model configs, and tensor factories
 - Naive PyTorch attention implementations used as correctness baselines
 """
+
+import os
+os.environ['TORCHDYNAMO_DISABLE'] = '1'
 
 import pytest
 import torch
 from torch import Tensor
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Pytest configuration
+# ---------------------------------------------------------------------------
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--cuda-device", default="cuda:0",
+        help="CUDA device to use for tests (e.g. cuda:0, cuda:1)"
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "gpu: tests that require a CUDA GPU")
+    config.addinivalue_line("markers", "slow: tests that take more than 10 seconds")
+    config.addinivalue_line("markers", "model: tests that require model weights")
 
 
 # ---------------------------------------------------------------------------
@@ -21,11 +43,17 @@ def cuda_available():
 
 
 @pytest.fixture
-def device():
-    """Return 'cuda' if available, otherwise skip the test."""
+def device(request):
+    """Return the CUDA device specified by --cuda-device (default cuda:0).
+
+    Also sets it as the current device so that Triton kernels launch on
+    the same device where test tensors are allocated.
+    """
     if not cuda_available():
         pytest.skip("CUDA not available")
-    return "cuda"
+    dev = request.config.getoption("--cuda-device")
+    torch.cuda.set_device(dev)
+    return dev
 
 
 # ---------------------------------------------------------------------------
