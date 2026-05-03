@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -7,9 +8,11 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.pipeline_stage import PipelineStageModel
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.distributed import set_tp_group
 
 
 class ModelRunner:
@@ -22,15 +25,62 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.pp_size = config.pipeline_parallel_size
+        self.pp_rank = config.pp_rank
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        # Isolate Triton cache per rank to avoid JIT compilation races
+        os.environ.setdefault("TRITON_CACHE_DIR", f"/tmp/triton_cache_rank{self.pp_rank}")
+
+        # For PP-only (TP=1): each stage is its own process, world_size=pp_size
+        if self.pp_size > 1 and self.world_size == 1:
+            nccl_world_size = self.pp_size
+            nccl_rank = self.pp_rank
+        else:
+            nccl_world_size = self.world_size
+            nccl_rank = rank
+
+        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=nccl_world_size, rank=nccl_rank)
+        torch.cuda.set_device(nccl_rank)
+
+        # Create TP subgroups so TP collectives only run within a PP stage
+        if self.pp_size > 1:
+            for pp in range(self.pp_size):
+                ranks = list(range(pp * self.world_size, (pp + 1) * self.world_size))
+                group = dist.new_group(ranks)
+                if pp == self.pp_rank:
+                    self.tp_group = group
+            set_tp_group(self.tp_group)
+        else:
+            self.tp_group = None
+
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
+
+        if self.pp_size > 1:
+            self.model = PipelineStageModel(hf_config, self.pp_rank, self.pp_size)
+            load_model(self.model, config.model, self.pp_rank, self.pp_size)
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
+            load_model(self.model, config.model)
+
+        self.sampler = Sampler() if self._is_last_stage() else None
+
+        # Setup shared memory BEFORE warmup (warmup needs PP coordination)
+        if self.pp_size > 1:
+            if self.pp_rank == 0:
+                try:
+                    existing = SharedMemory(name="nanovllm_pp")
+                    existing.close()
+                    existing.unlink()
+                except FileNotFoundError:
+                    pass
+                self.shm_pp = SharedMemory(name="nanovllm_pp", create=True, size=2**20)
+                dist.barrier()
+            else:
+                dist.barrier()
+                self.shm_pp = SharedMemory(name="nanovllm_pp")
+
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -38,7 +88,9 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
+        if self.pp_size > 1 and self.pp_rank > 0:
+            self.pp_loop()
+        elif self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
@@ -47,16 +99,26 @@ class ModelRunner:
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
+    def _is_last_stage(self):
+        return self.pp_rank == self.pp_size - 1
+
     def exit(self):
-        if self.world_size > 1:
+        if self.pp_size > 1:
+            if self.pp_rank == 0:
+                self.shm_pp.close()
+                self.shm_pp.unlink()
+            else:
+                self.shm_pp.close()
+        elif self.world_size > 1:
             self.shm.close()
-            dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
+
+    # ── TP worker loop ──────────────────────────────────────────────
 
     def loop(self):
         while True:
@@ -88,17 +150,86 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    # ── PP worker loop ──────────────────────────────────────────────
+
+    def pp_loop(self):
+        """Non-first pipeline stage loop: receive commands from stage 0."""
+        while True:
+            method_name, args = self._read_pp_shm()
+            getattr(self, method_name)(*args)
+            if method_name == "exit":
+                break
+
+    def _read_pp_shm(self):
+        assert self.pp_rank > 0
+        # Block until stage 0 signals via NCCL barrier that shm data is ready
+        dist.barrier()
+        n = int.from_bytes(self.shm_pp.buf[0:4], "little")
+        method_name, *args = pickle.loads(self.shm_pp.buf[4:n+4])
+        return method_name, args
+
+    def _write_pp_shm(self, method_name, *args):
+        assert self.pp_rank == 0
+        data = pickle.dumps([method_name, *args])
+        n = len(data)
+        self.shm_pp.buf[0:4] = n.to_bytes(4, "little")
+        self.shm_pp.buf[4:n+4] = data
+        dist.barrier()
+
+    def _call_pp(self, method_name, *args):
+        """Call method on all PP stages (stage 0 writes shm, then calls locally)."""
+        if self.pp_rank == 0:
+            self._write_pp_shm(method_name, *args)
+        return getattr(self, method_name)(*args)
+
+    # ── Common methods ──────────────────────────────────────────────
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
+        # For PP, use smaller warmup to avoid Triton kernel OOM on older GPUs
+        if self.pp_size > 1:
+            seq_len = min(seq_len, 1024)
+            num_seqs = min(num_seqs, 2)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        # Use direct NCCL path for warmup (shm-based PP loop not running yet)
+        self._warmup_pp(seqs, True) if self.pp_size > 1 else self.run(seqs, True)
         torch.cuda.empty_cache()
+
+    def _warmup_pp(self, seqs, is_prefill):
+        """Direct NCCL warmup without shm-based coordination."""
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        self._run_model_pp_direct(input_ids, positions, is_prefill)
+        reset_context()
+        # Synchronize so both stages finish warmup before proceeding
+        if self.pp_size > 1:
+            dist.barrier()
+
+    @torch.inference_mode()
+    def _run_model_pp_direct(self, input_ids, positions, is_prefill):
+        """Direct NCCL send/recv for warmup (no shm coordination)."""
+        hf_config = self.config.hf_config
+        hidden_size = hf_config.hidden_size
+
+        if self.pp_rank == 0:
+            hidden_states, residual = self.model(input_ids, positions)
+            dist.send(hidden_states, dst=1)
+            if residual is not None:
+                dist.send(residual, dst=1)
+        else:
+            num_tokens = input_ids.size(0)
+            hidden_states = torch.empty(num_tokens, hidden_size, device=f"cuda:{self.pp_rank}", dtype=hf_config.dtype)
+            dist.recv(hidden_states, src=0)
+            residual = torch.empty(num_tokens, hidden_size, device=f"cuda:{self.pp_rank}", dtype=hf_config.dtype)
+            dist.recv(residual, src=0)
+            # Skip model forward on rank 1 during warmup to avoid Triton OOM
+            # on heterogeneous GPUs; first real request will JIT-compile kernels
+            # self.model(input_ids, positions, hidden_states, residual)
 
     def allocate_kv_cache(self):
         config = self.config
@@ -109,10 +240,14 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        num_layers = self.model.num_stage_layers if self.pp_size > 1 else hf_config.num_hidden_layers
+        block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        available = int(total * config.gpu_memory_utilization - used - peak + current)
+        # Reserve ~2GB for Triton JIT compilation and runtime overhead
+        reserved = 2 * 1024 * 1024 * 1024
+        config.num_kvcache_blocks = max(1, (available - reserved) // block_bytes)
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, num_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -194,6 +329,10 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        if self.pp_size > 1:
+            return self._run_model_pp(input_ids, positions, is_prefill)
+
+        # Original non-PP path
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
@@ -211,13 +350,86 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    @torch.inference_mode()
+    def _run_model_pp(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        """Pipeline-parallel forward: stage 0 runs layers then sends to stage 1."""
+        hf_config = self.config.hf_config
+        hidden_size = hf_config.hidden_size
+
+        if self.pp_rank == 0:
+            # Stage 0: run forward, send hidden_states + residual to stage 1
+            if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+                hidden_states, residual = self.model(input_ids, positions)
+            else:
+                hidden_states, residual = self._run_graph_pp(input_ids, positions)
+
+            dist.send(hidden_states, dst=1)
+            if residual is not None:
+                dist.send(residual, dst=1)
+            return None  # Stage 0 doesn't produce logits
+
+        else:
+            # Stage 1: recv hidden_states + residual, run forward
+            num_tokens = input_ids.size(0)
+            hidden_states = torch.empty(num_tokens, hidden_size, device=f"cuda:{self.pp_rank}", dtype=hf_config.dtype)
+            dist.recv(hidden_states, src=0)
+            residual = torch.empty(num_tokens, hidden_size, device=f"cuda:{self.pp_rank}", dtype=hf_config.dtype)
+            dist.recv(residual, src=0)
+
+            # Run stage 1 layers + norm + lm_head
+            hidden_states, _ = self.model(input_ids, positions, hidden_states, residual)
+            return hidden_states  # This is logits from lm_head
+
+    def _run_graph_pp(self, input_ids, positions):
+        """CUDA graph replay for PP stage 0 decode."""
+        bs = input_ids.size(0)
+        context = get_context()
+        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_vars = self.graph_vars
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        return graph_vars["output_hidden"][:bs], graph_vars["output_residual"][:bs]
+
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures = self.prepare_sample(seqs) if self._is_last_stage() else None
+
+        if self.pp_size > 1:
+            return self._run_pp(seqs, input_ids, positions, is_prefill, temperatures)
+
+        # Original non-PP path
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def _run_pp(self, seqs, input_ids, positions, is_prefill, temperatures):
+        """PP orchestration: stage 0 drives, stage 1 follows.
+
+        Note: shm signaling is already done by _call_pp; this method only runs
+        the local model forward and sampling.
+        """
+        logits = self.run_model(input_ids, positions, is_prefill)
+        if self._is_last_stage():
+            token_ids = self.sampler(logits, temperatures).tolist()
+            # Send token_ids back to stage 0
+            token_tensor = torch.tensor(token_ids, dtype=torch.int64, device=f"cuda:{self.pp_rank}")
+            dist.send(token_tensor, dst=0)
+            reset_context()
+            return token_ids
+        else:
+            # Receive token_ids from last stage
+            num_seqs = len(seqs)
+            token_tensor = torch.empty(num_seqs, dtype=torch.int64, device=f"cuda:{self.pp_rank}")
+            dist.recv(token_tensor, src=self.pp_size - 1)
+            reset_context()
+            return token_tensor.tolist()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -230,7 +442,9 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        hidden_size = hf_config.hidden_size
+        output_hidden = torch.zeros(max_bs, hidden_size)
+        output_residual = torch.zeros(max_bs, hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
@@ -238,9 +452,18 @@ class ModelRunner:
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            if self.pp_size > 1 and self.pp_rank == 0:
+                # Stage 0: model returns (hidden_states, residual)
+                output_hidden[:bs], output_residual[:bs] = self.model(input_ids[:bs], positions[:bs])
+                with torch.cuda.graph(graph, self.graph_pool):
+                    output_hidden[:bs], output_residual[:bs] = self.model(input_ids[:bs], positions[:bs])
+            else:
+                # Original path or last stage
+                outputs = torch.zeros(max_bs, hidden_size)
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                output_hidden = outputs
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
@@ -253,5 +476,6 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
-            outputs=outputs,
+            output_hidden=output_hidden,
+            output_residual=output_residual,
         )

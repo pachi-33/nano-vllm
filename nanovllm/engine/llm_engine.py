@@ -1,4 +1,5 @@
 import atexit
+from copy import copy
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -22,20 +23,37 @@ class LLMEngine:
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+
+        if config.pipeline_parallel_size > 1:
+            # PP mode: spawn stage 1..N-1 processes
+            for i in range(1, config.pipeline_parallel_size):
+                config_copy = copy(config)
+                config_copy.pp_rank = i
+                process = ctx.Process(target=ModelRunner, args=(config_copy, i, None))
+                process.start()
+                self.ps.append(process)
+            config.pp_rank = 0
+            self.model_runner = ModelRunner(config, 0, None)
+        else:
+            # Original TP mode
+            for i in range(1, config.tensor_parallel_size):
+                event = ctx.Event()
+                process = ctx.Process(target=ModelRunner, args=(config, i, event))
+                process.start()
+                self.ps.append(process)
+                self.events.append(event)
+            self.model_runner = ModelRunner(config, 0, self.events)
+
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
+        if self.model_runner.pp_size > 1:
+            self.model_runner._call_pp("exit")
+        else:
+            self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
@@ -44,13 +62,22 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        seq.arrival_time = perf_counter()
         self.scheduler.add(seq)
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if self.model_runner.pp_size > 1:
+            token_ids = self.model_runner._call_pp("run", seqs, is_prefill)
+        else:
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        now = perf_counter()
+        if is_prefill:
+            for seq in seqs:
+                seq.first_token_time = now
+                seq.prefill_complete_time = now
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
