@@ -17,9 +17,25 @@ python example.py
 
 # Run benchmark
 python bench.py
+
+# Run OpenAI-compatible API server
+python -m nanovllm.serve --model ~/huggingface/Qwen3-0.6B_fp16/
 ```
 
-There is no test suite in this repository. Verification is done by running `example.py` or `bench.py`.
+## Testing
+
+The test suite is organized into three tiers under `tests/`:
+
+- `tests/unit/` — Kernel-level tests (no model needed, seconds)
+- `tests/integration/` — Engine-level tests with in-process LLMEngine (needs model, minutes)
+- `tests/server/` — HTTP API tests with subprocess server (needs model + `httpx`)
+
+```bash
+pytest tests/unit/ -v                      # unit tests only
+pytest tests/integration/ -v               # integration tests
+pytest tests/server/ -v -s                 # server tests
+pytest tests/server/ -v -s --pp 2          # server tests with pipeline parallelism
+```
 
 ## Architecture
 

@@ -28,7 +28,10 @@ class Sequence:
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
+        self.top_p = sampling_params.top_p
+        self.stop = sampling_params.stop
         self.ignore_eos = sampling_params.ignore_eos
+        self.stop_reason: str | None = None  # "stop" or "length"
         self.arrival_time: float = 0.0
         self.prefill_complete_time: float | None = None
         self.first_token_time: float | None = None
@@ -77,13 +80,13 @@ class Sequence:
         return (self.seq_id, self.status.value, self.is_prefill,
                 self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
                 self.block_table, last_state,
-                self.temperature, self.max_tokens, self.ignore_eos)
+                self.temperature, self.max_tokens, self.top_p, self.stop, self.ignore_eos)
 
     def __setstate__(self, state):
         (self.seq_id, status_value, self.is_prefill,
          self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
          self.block_table, last_state,
-         self.temperature, self.max_tokens, self.ignore_eos) = state
+         self.temperature, self.max_tokens, self.top_p, self.stop, self.ignore_eos) = state
         self.status = SequenceStatus(status_value)
         if isinstance(last_state, list):
             self.token_ids = last_state

@@ -15,6 +15,7 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self._stop_token_ids: dict[int, list[int]] = {}  # seq_id -> stop token ids
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -68,7 +69,8 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        if not scheduled_seqs:
+            return [], False
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
@@ -78,7 +80,7 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool, tokenizer=None):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
@@ -86,7 +88,35 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            # Check stop conditions
+            stop_hit = False
+            if seq.stop and tokenizer is not None:
+                text = tokenizer.decode(seq.completion_token_ids, skip_special_tokens=True)
+                for stop_str in seq.stop:
+                    idx = text.find(stop_str)
+                    if idx != -1:
+                        stop_hit = True
+                        # Truncate tokens so the decoded text excludes the stop string
+                        while seq.num_completion_tokens > 0:
+                            trial_text = tokenizer.decode(seq.completion_token_ids, skip_special_tokens=True)
+                            if stop_str not in trial_text:
+                                break
+                            seq.token_ids.pop()
+                            seq.last_token = seq.token_ids[-1]
+                            seq.num_tokens -= 1
+                        break
+            if stop_hit:
+                seq.stop_reason = "stop"
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+            elif (not seq.ignore_eos and token_id == self.eos):
+                seq.stop_reason = "stop"
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+            elif seq.num_completion_tokens == seq.max_tokens:
+                seq.stop_reason = "length"
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

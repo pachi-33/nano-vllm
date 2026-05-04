@@ -26,6 +26,14 @@ def pytest_addoption(parser):
         "--cuda-device", default="cuda:0",
         help="CUDA device to use for tests (e.g. cuda:0, cuda:1)"
     )
+    parser.addoption(
+        "--model", type=str,
+        default=os.path.expanduser("~/huggingface/Qwen3-0.6B_fp16/"),
+        help="Path to model weights for server tests"
+    )
+    parser.addoption("--pp", type=int, default=1, help="Pipeline parallel size for server tests")
+    parser.addoption("--tp", type=int, default=1, help="Tensor parallel size for server tests")
+    parser.addoption("--port", type=int, default=8999, help="Base port for test server")
 
 
 def pytest_configure(config):

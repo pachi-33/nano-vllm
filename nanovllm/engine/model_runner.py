@@ -324,8 +324,10 @@ class ModelRunner:
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
+        top_ps = [seq.top_p for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+        top_ps = torch.tensor(top_ps, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        return temperatures, top_ps
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -348,7 +350,7 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return self.model.compute_logits(graph_vars["output_hidden"][:bs])
 
     @torch.inference_mode()
     def _run_model_pp(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -398,18 +400,18 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self._is_last_stage() else None
+        sample_params = self.prepare_sample(seqs) if self._is_last_stage() else None
 
         if self.pp_size > 1:
-            return self._run_pp(seqs, input_ids, positions, is_prefill, temperatures)
+            return self._run_pp(seqs, input_ids, positions, is_prefill, sample_params)
 
         # Original non-PP path
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, *sample_params).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
-    def _run_pp(self, seqs, input_ids, positions, is_prefill, temperatures):
+    def _run_pp(self, seqs, input_ids, positions, is_prefill, sample_params):
         """PP orchestration: stage 0 drives, stage 1 follows.
 
         Note: shm signaling is already done by _call_pp; this method only runs
@@ -417,7 +419,7 @@ class ModelRunner:
         """
         logits = self.run_model(input_ids, positions, is_prefill)
         if self._is_last_stage():
-            token_ids = self.sampler(logits, temperatures).tolist()
+            token_ids = self.sampler(logits, *sample_params).tolist()
             # Send token_ids back to stage 0
             token_tensor = torch.tensor(token_ids, dtype=torch.int64, device=f"cuda:{self.pp_rank}")
             dist.send(token_tensor, dst=0)
@@ -433,6 +435,15 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        # Non-first PP stages have no graph replay path in _run_model_pp,
+        # so skip capture entirely.
+        if self.pp_size > 1 and self.pp_rank != 0:
+            self.graphs = {}
+            self.graph_vars = {}
+            self.graph_bs = []
+            self.graph_pool = None
+            return
+
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)

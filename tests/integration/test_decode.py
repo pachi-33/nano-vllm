@@ -6,7 +6,8 @@ per sequence from the paged KV cache.
 """
 
 import pytest
-from nanovllm.engine.sequence import SequenceStatus
+from nanovllm.engine.sequence import Sequence, SequenceStatus
+from nanovllm.sampling_params import SamplingParams
 
 
 class TestDecode:
@@ -52,9 +53,13 @@ class TestDecode:
         With prompt_len=254: after prefill → 255 tokens, 1 block.
         After 2 decode steps → 257 tokens. At the next schedule call (3rd decode),
         len=257 → 257 % 256 == 1 → new block allocated.
+
+        Uses ignore_eos=True to prevent the model from ending the sequence early
+        with an EOS token (the test prompt is arbitrary token IDs, not real text).
         """
         prompt_len = 254
-        seq = make_sequence(list(range(prompt_len)), max_tokens=10)
+        sp = SamplingParams(temperature=0.6, max_tokens=10, ignore_eos=True)
+        seq = Sequence(list(range(prompt_len)), sp)
         do_prefill([seq])
 
         blocks_before = len(seq.block_table)

@@ -364,52 +364,42 @@ def main():
     modes = ["latency", "memory", "stress", "quality"] if args.mode == "all" else [args.mode]
     workloads = list(WORKLOADS.keys()) if args.workload == "all" else [args.workload]
 
+    # Create a single LLM instance shared across all modes to avoid
+    # "trying to initialize the default process group twice!" — PyTorch
+    # does not allow dist.init_process_group() after destroy_process_group().
+    llm = LLM(args.model, enforce_eager=args.enforce_eager,
+               pipeline_parallel_size=args.pipeline_parallel_size,
+               tensor_parallel_size=args.tensor_parallel_size)
+
     for mode in modes:
         if mode == "latency":
-            llm = LLM(args.model, enforce_eager=args.enforce_eager,
-                       pipeline_parallel_size=args.pipeline_parallel_size,
-                       tensor_parallel_size=args.tensor_parallel_size)
             results["latency"] = {}
             for wl in workloads:
                 r = run_latency(llm, wl)
                 print_latency(r)
                 results["latency"][wl] = r
-            del llm
-            torch.cuda.empty_cache()
 
         elif mode == "memory":
-            llm = LLM(args.model, enforce_eager=args.enforce_eager,
-                       pipeline_parallel_size=args.pipeline_parallel_size,
-                       tensor_parallel_size=args.tensor_parallel_size)
             results["memory"] = {}
             for wl in workloads:
                 r = run_memory(llm, wl)
                 print_memory(r)
                 results["memory"][wl] = r
-            del llm
-            torch.cuda.empty_cache()
 
         elif mode == "stress":
-            llm = LLM(args.model, enforce_eager=args.enforce_eager,
-                       pipeline_parallel_size=args.pipeline_parallel_size,
-                       tensor_parallel_size=args.tensor_parallel_size)
             r = run_stress(llm, args.duration)
             print_stress(r)
             results["stress"] = r
-            del llm
-            torch.cuda.empty_cache()
 
         elif mode == "quality":
             # PPL uses HF model directly
             ppl = run_perplexity(args.model) if args.pipeline_parallel_size == 1 else None
-            llm = LLM(args.model, enforce_eager=args.enforce_eager,
-                       pipeline_parallel_size=args.pipeline_parallel_size,
-                       tensor_parallel_size=args.tensor_parallel_size)
             sanity = run_sanity_check(llm)
             print_quality(ppl, sanity)
             results["quality"] = {"ppl": ppl, "sanity": {"passed": sanity["passed"], "total": sanity["total"]}}
-            del llm
-            torch.cuda.empty_cache()
+
+    del llm
+    torch.cuda.empty_cache()
 
     if args.output:
         with open(args.output, "w") as f:

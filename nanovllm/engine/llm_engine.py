@@ -47,9 +47,12 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.model_name = config.model.rstrip("/").split("/")[-1]
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, 'model_runner'):
+            return
         if self.model_runner.pp_size > 1:
             self.model_runner._call_pp("exit")
         else:
@@ -64,15 +67,18 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         seq.arrival_time = perf_counter()
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        if not seqs:
+            return [], 0
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         if self.model_runner.pp_size > 1:
             token_ids = self.model_runner._call_pp("run", seqs, is_prefill)
         else:
             token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        self.scheduler.postprocess(seqs, token_ids, is_prefill, self.tokenizer)
         now = perf_counter()
         if is_prefill:
             for seq in seqs:
@@ -115,3 +121,48 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs
+
+    def generate_stream(self, prompt: str | list[int], sampling_params: SamplingParams):
+        """Stream tokens one by one. Yields (token_id, text, finished) tuples."""
+        request_id = self.add_request(prompt, sampling_params)
+        yielded_tokens = 0
+        while not self.is_finished():
+            # Snapshot completion count before step
+            before_count = 0
+            for seq in self.scheduler.running:
+                if seq.seq_id == request_id:
+                    before_count = seq.num_completion_tokens
+            finished_outputs, _ = self.step()
+            # After step, get the new count from running or finished outputs
+            after_count = before_count
+            for seq in list(self.scheduler.running):
+                if seq.seq_id == request_id:
+                    after_count = seq.num_completion_tokens
+            # If sequence was finished, reconstruct from step output
+            is_done = False
+            for seq_id, token_ids in finished_outputs:
+                if seq_id == request_id:
+                    after_count = len(token_ids)
+                    is_done = True
+            # Yield newly generated tokens
+            while yielded_tokens < after_count:
+                token_id = None
+                # Try to get from running sequences first
+                for seq in list(self.scheduler.running):
+                    if seq.seq_id == request_id and yielded_tokens < seq.num_completion_tokens:
+                        token_id = seq.completion_token_ids[yielded_tokens]
+                        break
+                # If sequence was removed, get from finished outputs
+                if token_id is None:
+                    for seq_id, token_ids in finished_outputs:
+                        if seq_id == request_id and yielded_tokens < len(token_ids):
+                            token_id = token_ids[yielded_tokens]
+                            break
+                if token_id is not None:
+                    text = self.tokenizer.decode([token_id])
+                    yielded_tokens += 1
+                    yield token_id, text, is_done and yielded_tokens >= after_count
+                else:
+                    break
+            if is_done:
+                return

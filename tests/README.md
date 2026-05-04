@@ -4,19 +4,22 @@
 
 ```
 tests/
-├── conftest.py              # 全局配置：GPU 设备选择、模型参数、参考实现
+├── conftest.py              # 全局配置：GPU 设备选择、模型参数、CLI 选项、参考实现
 ├── unit/                    # 单元测试（不需要模型，秒级完成）
 │   ├── conftest.py          # 单元测试专用 fixtures（预留）
 │   ├── test_store_kvcache.py       # KV 缓存写入 kernel 测试
 │   ├── test_decode_attention.py    # Decode attention kernel 测试
 │   └── test_prefill_attention.py   # Prefill attention kernel 测试
-└── integration/             # 集成测试（需要加载模型，分钟级）
-    ├── conftest.py                 # LLM Engine fixture、辅助工厂函数
-    ├── test_single_prefill.py      # 单序列 prefill
-    ├── test_batched_prefill.py     # 多序列 batched prefill
-    ├── test_decode.py              # Decode 阶段（单步、多步、batched）
-    ├── test_prefill_then_decode.py # 完整推理流水线（prefill → decode 循环）
-    └── test_prefix_cache.py        # 前缀缓存（block 复用、正确性验证）
+├── integration/             # 集成测试（需要加载模型，分钟级）
+│   ├── conftest.py                 # LLM Engine fixture、辅助工厂函数
+│   ├── test_single_prefill.py      # 单序列 prefill
+│   ├── test_batched_prefill.py     # 多序列 batched prefill
+│   ├── test_decode.py              # Decode 阶段（单步、多步、batched）
+│   ├── test_prefill_then_decode.py # 完整推理流水线（prefill → decode 循环）
+│   └── test_prefix_cache.py        # 前缀缓存（block 复用、正确性验证）
+└── server/                  # 服务测试（启动 HTTP 服务器，通过 API 测试）
+    ├── conftest.py                 # 服务器子进程 fixture、httpx 客户端
+    └── test_server.py              # OpenAI 兼容 API 端点测试
 ```
 
 ## 运行测试
@@ -27,6 +30,15 @@ pytest tests/unit/ -v
 
 # 跑全部集成测试（需要模型，几分钟）
 pytest tests/integration/ -v
+
+# 跑服务测试（需要模型 + pip install httpx，启动子进程服务器）
+pytest tests/server/ -v -s
+
+# 跑服务测试（流水线并行模式）
+pytest tests/server/ -v -s --pp 2
+
+# 跑服务测试（自定义模型路径）
+pytest tests/server/ -v -s --model /path/to/model
 
 # 在指定 GPU 上跑
 pytest tests/unit/ -v --cuda-device cuda:1
@@ -66,6 +78,20 @@ pytest -v
    - `do_step`：执行一次完整 engine.step() 的辅助函数
 3. 测试模式：构造 Sequence → do_prefill → do_step → 验证序列状态
 
+### 新增服务测试
+
+1. 在 `tests/server/` 下创建 `test_xxx.py`
+2. 使用 `tests/server/conftest.py` 中的 fixture：
+   - `server`：启动 nano-vllm 服务器子进程，返回 base_url（module 级别，同一模块共享）
+   - `http`：指向测试服务器的 httpx.Client（module 级别）
+3. CLI 选项（在 `tests/conftest.py` 中注册）：
+   - `--model`：模型路径（默认 `~/huggingface/Qwen3-0.6B_fp16/`）
+   - `--pp`：流水线并行大小（默认 1）
+   - `--tp`：张量并行大小（默认 1）
+   - `--port`：服务器端口（默认 8999）
+4. 测试模式：通过 httpx 发送 HTTP 请求 → 验证响应状态码和 JSON 结构
+5. 注意：服务测试会启动独立的服务器子进程，不与 `tests/integration/` 共享 LLMEngine
+
 ## Fixture 说明
 
 ### 全局 fixture（tests/conftest.py）
@@ -93,6 +119,13 @@ pytest -v
 | `make_sequence` | function | 创建 Sequence 对象的工厂 |
 | `do_prefill` | function | 执行 prefill 的辅助函数 |
 | `do_step` | function | 执行一次 engine.step() 的辅助函数 |
+
+### 服务测试 fixture（tests/server/conftest.py）
+
+| Fixture | 作用域 | 说明 |
+|---------|--------|------|
+| `server` | module | 启动服务器子进程，等待健康检查通过后返回 base_url，测试结束后关闭 |
+| `http` | module | 指向测试服务器的 httpx.Client（超时 30s） |
 
 ## 注意事项
 
